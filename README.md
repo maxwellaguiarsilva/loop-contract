@@ -31,7 +31,7 @@ To start the infinity loop, execute:
 
 Each fresh session in the loop:
 
-1. **Intake check** — if `prompt.md` exists at the project root, the session is dedicated to internalizing the user's request: it enhances the request, writes its tasks into the stack-tree (decomposing into substacks as needed), and removes `prompt.md`.
+1. **Intake check** — `prompt.md` is the single conditional entry. If it exists at the project root, the session is dedicated to intake: either internalizing a user's request (enhancing it and writing its tasks into the stack-tree) or running disaster recovery on a processed overflow handoff written by the runner. Either way it ends by removing `prompt.md`.
 2. Reads `docs/agent/stack-tree/index.md` — the root — and follows the **current path** to the active node's frame (Active Role, Stack Depth, Mandate, Target Artifact). Only the nodes on the current path are loaded, never the whole tree.
 3. Reads the compliance rules and the project docs scoped to the task, on demand.
 4. Executes the active mandate (or picks **one** pending task from the tree if running as `orchestrator`).
@@ -45,7 +45,7 @@ Large or isolated work is delegated by **push** onto the stack-tree: a child nod
 The contract is coupled to **`project-mcp-tools`** (a sibling repo at `../project-mcp-tools` relative to the project root) for one tool: **`session_context_usage`**, which reads the current opencode session's real token usage (`context_used`, `context_percent`, model limit) straight from the opencode database.
 
 - The budget rules (Context hygiene in `loop.md`) call this tool for usage measurement.
-- `run-loop` also uses it as an external watchdog: each session runs in the background while the runner polls token usage; on crossing the 100k cap it kills the session and exports its transcript to `loop-violation.md`, so the next iteration enters **disaster recovery** (see `loop.md`) and registers the unfinished work as stack-tree tasks instead of losing it.
+- `run-loop` also uses it as an external watchdog: each session runs in the background while the runner polls token usage; on crossing the 100k cap it kills the session, exports its transcript, and — through the disaster-recovery pipeline — writes a disaster-recovery prompt into `prompt.md` (the single conditional entry), so the next iteration enters **disaster recovery** (see `loop.md`) and registers the unfinished work as stack-tree tasks instead of losing it.
 - `opencode.json` in the project root registers it as a local MCP server. `deploy` creates both the symlink and this config automatically.
 - This coupling is the **only** non-generic part of the contract. Everything else is portable.
 

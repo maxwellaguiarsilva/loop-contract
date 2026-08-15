@@ -9,11 +9,11 @@ MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 # Environment variables:
 #   MODEL           - model ID
 #   PROMPT          - contract file to attach
-#   INTAKE          - user prompt intake file, translated to en-us before the session
+#   INTAKE          - the single conditional entry (prompt.md): a user request or a
+#                     contract-recovery prompt; translated to en-us before the session
 #   BUDGET          - hard token cap enforced by the watchdog
 #   WATCH_INTERVAL  - watchdog poll interval in seconds
-#   VIOLATION       - processed disaster-recovery handoff file, the disaster-recovery signal
-#   TRANSCRIPT      - raw overflow export of the killed session, own file so it never collides with VIOLATION
+#   TRANSCRIPT      - raw overflow export of the killed session, own file so it never collides with INTAKE
 #   DR_SUMMARY      - pipeline temp: summary of the overflowed session
 #   DR_PLAN         - pipeline temp: decomposition plan
 #   USAGE_TOOL      - token usage probe
@@ -26,7 +26,7 @@ MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 # the session transcript to TRANSCRIPT
 # and kills the runaway process so the next iteration enters disaster recovery
 # (see loop.md) instead of failing silently.
-# Exception: while VIOLATION exists (a disaster recovery is in progress), the
+# Exception: while INTAKE exists (an intake or disaster recovery is in progress), the
 # watchdog never kills — analyzing the exported transcript can legitimately exceed
 # BUDGET, and killing it would kill the recovery itself.
 #
@@ -36,7 +36,7 @@ MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 # intake ordering the next session to register them into the stack-tree (inside the
 # current active node), and kills the violating session — the items then run as
 # normal one-task-per-session work instead of diverging state. The kill is skipped
-# while a prompt.md, VIOLATION or TRANSCRIPT already exists (deferred, never overwrite).
+# while a prompt.md or TRANSCRIPT already exists (deferred, never overwrite).
 #
 # Session guard: the probe auto-resolves the most recently *updated* session, but a
 # freshly spawned `opencode run` has no DB row yet, so the probe could resolve the
@@ -52,10 +52,11 @@ MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 #                   task the overflowed session attempted (DR_SUMMARY);
 #   2. decompose  — a session reads the summary + loop.md and writes a detailed plan breaking
 #                   that work into small per-session tasks (DR_PLAN);
-#   3. assemble   — the runner joins summary + plan into the processed VIOLATION file, then
-#                   deletes the temporary files and the raw TRANSCRIPT.
+#   3. assemble   — the runner joins summary + plan into a disaster-recovery prompt written
+#                   to INTAKE (prompt.md, the single conditional entry), then deletes the
+#                   temporary files and the raw TRANSCRIPT.
 # After the pipeline, the runner calls git-reset-repository: it commits the current state
-# (including the processed VIOLATION), deletes the remote, re-inits the git history and
+# (including the recovery prompt), deletes the remote, re-inits the git history and
 # re-pushes as a fresh repository. The next session then does disaster recovery on a small,
 # already-decomposed handoff — forcing proper decomposition in the stack-tree instead of a
 # raw overflow transcript.
@@ -76,7 +77,6 @@ PROMPT="${PROMPT:-loop.md}"
 INTAKE="${INTAKE:-prompt.md}"
 BUDGET="${BUDGET:-100000}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-60}"
-VIOLATION="${VIOLATION:-loop-violation.md}"
 TRANSCRIPT="${TRANSCRIPT:-disaster-transcript.md}"
 USAGE_TOOL="${USAGE_TOOL:-scripts/session-context-usage}"
 AUDIT_ROOT="${AUDIT_ROOT:-docs/agent}"
@@ -192,7 +192,7 @@ run_session() {
     [[ -n "$usage" ]] || continue
     context_used="$( printf '%s' "$usage" | jq -r '.context_used // 0' 2>/dev/null || echo 0 )"
     [[ "${context_used:-0}" =~ ^[0-9]+$ ]] || continue
-    if (( context_used >= BUDGET )) && [[ ! -f "$VIOLATION" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
+    if (( context_used >= BUDGET )) && [[ ! -f "$INTAKE" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
       echo "==> BUDGET EXCEEDED (${context_used} tokens) — exporting raw session transcript"
       opencode export "$session_id" > "$TRANSCRIPT" 2>/dev/null || true
       echo "==> killing runaway session (pid $pid)"
@@ -204,7 +204,7 @@ run_session() {
     # Harness TODO watchdog: while no intake/recovery is already queued, capture any
     # use of the TODO tool, force the items into the stack-tree via a prompt.md
     # intake, and kill the diverging session.
-    if [[ ! -f "$INTAKE" ]] && [[ ! -f "$VIOLATION" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
+    if [[ ! -f "$INTAKE" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
       todos="$(sqlite3 "$db_path" "SELECT data FROM part WHERE session_id = '$session_id' AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') = 'todowrite' ORDER BY time_created ASC;" 2>/dev/null || true)"
       if [[ -n "$todos" ]]; then
         echo "==> HARNESS TODO VIOLATION — model used the TODO tool instead of the stack-tree"
@@ -256,7 +256,7 @@ print_token_usage() {
 
 # Disaster-recovery pipeline. Runs while the raw TRANSCRIPT export exists, before the
 # normal session, to pre-digest the overflowed session's transcript into a small,
-# already-decomposed handoff (the processed VIOLATION). Returns 0 on success, 1 on any
+# already-decomposed handoff (a disaster-recovery prompt in INTAKE). Returns 0 on success, 1 on any
 # step failure (loop aborts so it can be retried with the raw transcript intact).
 run_disaster_recovery_pipeline() {
   local summary="$DR_SUMMARY" plan="$DR_PLAN"
@@ -283,12 +283,12 @@ run_disaster_recovery_pipeline() {
 
   [[ -s "$plan" ]] || { echo "==> FATAL: pipeline step 2 produced no '$plan'" >&2; return 1; }
 
-  echo "    Step 3/3: assembling the processed $VIOLATION"
+  echo "    Step 3/3: assembling the disaster-recovery prompt ($INTAKE)"
 
   {
     echo "# Disaster recovery — processed session summary and decomposition plan"
     echo
-    echo "The previous session overflowed the context budget and was killed by the loop runner. This processed file (assembled by the run-loop disaster-recovery pipeline) replaces the raw exported transcript. It holds (1) a summary of every task that failed session attempted and (2) a detailed plan decomposing that work into small per-session tasks. Follow the Disaster recovery procedure in $PROMPT: register the decomposition plan below into the stack-tree as proper nodes/substacks, do NOT try to redo the work inline, then delete this file."
+    echo "The previous session overflowed the context budget and was killed by the loop runner. This prompt (assembled by the run-loop disaster-recovery pipeline) replaces the raw exported transcript. It holds (1) a summary of every task that failed session attempted and (2) a detailed plan decomposing that work into small per-session tasks. Follow the Disaster recovery procedure in $PROMPT: register the decomposition plan below into the stack-tree as proper nodes/substacks, do NOT try to redo the work inline, then delete this file (prompt.md)."
     echo
     echo "## 1. Summary of the failed session"
     echo
@@ -299,7 +299,7 @@ run_disaster_recovery_pipeline() {
     echo "## 2. Decomposition plan (small tasks across multiple sessions)"
     echo
     cat "$plan"
-  } > "$VIOLATION"
+  } > "$INTAKE"
 
   echo "==> removing temporary pipeline files"
   rm -f "$summary" "$plan" "$TRANSCRIPT"
