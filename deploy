@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# deploy.sh — install or update the loop-contract (with mandatory project-mcp-tools coupling)
+# deploy — install or update the loop-contract (with mandatory project-mcp-tools coupling)
 # into a target project safely without destroying existing project state.
-# Usage: ./deploy.sh /path/to/target/project
+# Usage: ./deploy /path/to/target/project
 #
 # File model (the two classes are never mixed):
-#   SPEC files    — the contract itself (loop.md, run-loop.sh, compliance-rules.md).
+#   SPEC files    — the contract itself (loop.md, run-loop, compliance-rules.md).
 #                   ALWAYS overwritten on deploy, so refining the contract and re-deploying
 #                   propagates the new specification to every installed project.
 #   CONTROL files — the stack-tree: docs/agent/stack-tree/index.md (root) plus the node
@@ -64,9 +64,10 @@ echo "==> updating specification (always overwritten)"
 
 # 1. Core entry file and runner script
 cp "$SRC_DIR/loop.md" "$TARGET/loop.md"
-cp "$SRC_DIR/run-loop.sh" "$TARGET/run-loop.sh"
-chmod +x "$TARGET/run-loop.sh"
-echo "updated: loop.md, run-loop.sh"
+cp "$SRC_DIR/run-loop" "$TARGET/run-loop"
+chmod +x "$TARGET/run-loop"
+rm -f "$TARGET/run-loop.sh"
+echo "updated: loop.md, run-loop"
 
 # 2. Compliance rules
 mkdir -p "$TARGET/docs/agent"
@@ -120,19 +121,13 @@ The stack-tree is the contract's single persistent state: a flat folder of markd
 - *When a task needs decomposition, create a child node markdown (a sibling file in this folder), link it under Tasks above, and update the Current path.*
 EOF
 
-# 4. Wire the project-mcp-tools coupling
-if [[ -e "$TARGET/project-mcp-tools" ]]; then
-  echo "kept: existing project-mcp-tools entry"
-else
-  ln -s ../project-mcp-tools "$TARGET/project-mcp-tools"
-  echo "linked: project-mcp-tools -> ../project-mcp-tools"
-fi
-# Convenience symlink for the CLI aliases (run-loop.sh's watchdog default)
+# 4. Wire the project-mcp-tools coupling. Only the sibling-relative scripts
+# symlink is created; no project-mcp-tools symlink inside the project.
 if [[ -e "$TARGET/scripts" ]]; then
   echo "kept: existing scripts entry"
 else
-  ln -s project-mcp-tools/scripts "$TARGET/scripts"
-  echo "linked: scripts -> project-mcp-tools/scripts"
+  ln -s ../project-mcp-tools/scripts "$TARGET/scripts"
+  echo "linked: scripts -> ../project-mcp-tools/scripts"
 fi
 
 TARGET_NAME="$(basename "$TARGET")"
@@ -163,4 +158,4 @@ fi
 echo
 echo "loop-contract successfully deployed/updated at: $TARGET"
 echo "Specification updated; stack-tree control state preserved."
-echo "To start the infinity loop, run: ./run-loop.sh"
+echo "To start the infinity loop, run: ./run-loop"

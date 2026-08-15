@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# run-loop.sh — generic runner script to execute the multi-session infinity loop.
-# Usage: ./run-loop.sh [model]
-# Example: ./run-loop.sh deepseek/deepseek-v4-flash
+
+
+MODEL="${1:-${MODEL:-google/gemini-flash-lite-latest}}"
+
+# run-loop — generic runner script to execute the multi-session infinity loop.
+# Usage: ./run-loop [model]
 #
 # Environment variables:
-#   MODEL           - model ID (default: deepseek/deepseek-v4-flash)
-#   PROMPT          - contract file to attach (default: loop.md)
-#   INTAKE          - user prompt intake file, translated to en-us before the session (default: prompt.md)
-#   BUDGET          - hard token cap enforced by the watchdog (default: 100000)
-#   WATCH_INTERVAL  - watchdog poll interval in seconds (default: 60)
-#   VIOLATION       - processed disaster-recovery handoff file, the disaster-recovery signal (default: loop-violation.md)
-#   TRANSCRIPT      - raw overflow export of the killed session, own file so it never collides with VIOLATION (default: disaster-transcript.md)
-#   DR_SUMMARY      - pipeline temp: summary of the overflowed session (default: disaster-summary.md)
-#   DR_PLAN         - pipeline temp: decomposition plan (default: disaster-plan.md)
-#   USAGE_TOOL      - token usage probe (default: scripts/session-context-usage)
-#   AUDIT_ROOT      - dir audited for markdown line-limit compliance (default: docs/agent)
-#   NODE_LINE_LIMIT - max lines for a stack-tree node (default: 200)
-#   INDEX_LINE_LIMIT- max lines for stack-tree/index.md (default: 150)
+#   MODEL           - model ID
+#   PROMPT          - contract file to attach
+#   INTAKE          - user prompt intake file, translated to en-us before the session
+#   BUDGET          - hard token cap enforced by the watchdog
+#   WATCH_INTERVAL  - watchdog poll interval in seconds
+#   VIOLATION       - processed disaster-recovery handoff file, the disaster-recovery signal
+#   TRANSCRIPT      - raw overflow export of the killed session, own file so it never collides with VIOLATION
+#   DR_SUMMARY      - pipeline temp: summary of the overflowed session
+#   DR_PLAN         - pipeline temp: decomposition plan
+#   USAGE_TOOL      - token usage probe
+#   AUDIT_ROOT      - dir audited for markdown line-limit compliance
+#   NODE_LINE_LIMIT - max lines for a stack-tree node
+#   INDEX_LINE_LIMIT- max lines for stack-tree/index.md
 #
 # The watchdog runs each session in the background and polls the token usage via
 # the project-mcp-tools probe. If the session crosses BUDGET, the runner exports
-# the session transcript to TRANSCRIPT (raw overflow data, default disaster-transcript.md)
+# the session transcript to TRANSCRIPT
 # and kills the runaway process so the next iteration enters disaster recovery
 # (see loop.md) instead of failing silently.
 # Exception: while VIOLATION exists (a disaster recovery is in progress), the
@@ -46,16 +49,16 @@
 # sessions get "compassionate" with the overflowed task and abandon the contract again).
 # Instead it runs an artificial `opencode run` pipeline in three steps before the normal session:
 #   1. summarize  — a session reads the raw transcript and writes a compact summary of every
-#                   task the overflowed session attempted (DR_SUMMARY, default disaster-summary.md);
+#                   task the overflowed session attempted (DR_SUMMARY);
 #   2. decompose  — a session reads the summary + loop.md and writes a detailed plan breaking
-#                   that work into small per-session tasks (DR_PLAN, default disaster-plan.md);
+#                   that work into small per-session tasks (DR_PLAN);
 #   3. assemble   — the runner joins summary + plan into the processed VIOLATION file, then
 #                   deletes the temporary files and the raw TRANSCRIPT.
 # After the pipeline, the runner calls git-reset-repository: it commits the current state
 # (including the processed VIOLATION), deletes the remote, re-inits the git history and
 # re-pushes as a fresh repository. The next session then does disaster recovery on a small,
 # already-decomposed handoff — forcing proper decomposition in the stack-tree instead of a
-# ~100k transcript.
+# raw overflow transcript.
 #
 # Before each session, a compliance audit runs over every markdown under AUDIT_ROOT
 # (find -L follows symlinks). Any file at or over its line limit triggers a prompt.md
@@ -69,7 +72,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 PROMPT="${PROMPT:-loop.md}"
 INTAKE="${INTAKE:-prompt.md}"
 BUDGET="${BUDGET:-100000}"
@@ -80,7 +82,6 @@ USAGE_TOOL="${USAGE_TOOL:-scripts/session-context-usage}"
 AUDIT_ROOT="${AUDIT_ROOT:-docs/agent}"
 NODE_LINE_LIMIT="${NODE_LINE_LIMIT:-200}"
 INDEX_LINE_LIMIT="${INDEX_LINE_LIMIT:-150}"
-AUDIT_MARKER="stack-tree-compliance-reorg"
 DR_SUMMARY="${DR_SUMMARY:-disaster-summary.md}"
 DR_PLAN="${DR_PLAN:-disaster-plan.md}"
 
@@ -126,7 +127,7 @@ loop_spawned_pids() {
 # trap+exit would leave it running (and consuming budget) until the next watchdog
 # poll. SIGKILL the current session's process group, then every process carrying the
 # run marker (the full session tree, whatever process groups it split into), and any
-# sibling run-loop.sh watchdogs watching the same directory.
+# sibling run-loop watchdogs watching the same directory.
 stop_all() {
   local p pgid self_pgid
   echo "==> stopping loop — killing this loop's opencode sessions and watchdogs"
@@ -141,8 +142,8 @@ stop_all() {
     fi
     kill -KILL "$p" 2>/dev/null || true
   done
-  # Watchdogs: other run-loop.sh instances watching this same directory only.
-  for p in $(pgrep -f "run-loop\.sh" 2>/dev/null || true); do
+  # Watchdogs: other run-loop instances watching this same directory only.
+  for p in $(pgrep -f "run-loop(\.sh)?" 2>/dev/null || true); do
     [[ "$p" == "$$" ]] && continue
     [[ "$(readlink "/proc/$p/cwd" 2>/dev/null || true)" == "$SCRIPT_DIR" ]] || continue
     kill -KILL "$p" 2>/dev/null || true
