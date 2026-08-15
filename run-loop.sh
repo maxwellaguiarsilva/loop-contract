@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# run-loop.sh — generic runner script to execute the multi-session infinity loop.
+# Usage: ./run-loop.sh [model]
+# Example: ./run-loop.sh deepseek/deepseek-v4-flash
+#
+# Environment variables:
+#   MODEL           - model ID (default: deepseek/deepseek-v4-flash)
+#   PROMPT          - contract file to attach (default: loop.md)
+#   INTAKE          - user prompt intake file, translated to en-us before the session (default: prompt.md)
+#   BUDGET          - hard token cap enforced by the watchdog (default: 100000)
+#   WATCH_INTERVAL  - watchdog poll interval in seconds (default: 60)
+#   VIOLATION       - processed disaster-recovery handoff file, the disaster-recovery signal (default: loop-violation.md)
+#   TRANSCRIPT      - raw overflow export of the killed session, own file so it never collides with VIOLATION (default: disaster-transcript.md)
+#   DR_SUMMARY      - pipeline temp: summary of the overflowed session (default: disaster-summary.md)
+#   DR_PLAN         - pipeline temp: decomposition plan (default: disaster-plan.md)
+#   USAGE_TOOL      - token usage probe (default: scripts/session-context-usage)
+#   AUDIT_ROOT      - dir audited for markdown line-limit compliance (default: docs/agent)
+#   NODE_LINE_LIMIT - max lines for a stack-tree node (default: 200)
+#   INDEX_LINE_LIMIT- max lines for stack-tree/index.md (default: 150)
+#
+# The watchdog runs each session in the background and polls the token usage via
+# the project-mcp-tools probe. If the session crosses BUDGET, the runner exports
+# the session transcript to TRANSCRIPT (raw overflow data, default disaster-transcript.md)
+# and kills the runaway process so the next iteration enters disaster recovery
+# (see loop.md) instead of failing silently.
+# Exception: while VIOLATION exists (a disaster recovery is in progress), the
+# watchdog never kills — analyzing the exported transcript can legitimately exceed
+# BUDGET, and killing it would kill the recovery itself.
+#
+# Harness TODO watchdog: loop.md forbids the TODO tool ("Use the contract, not the
+# harness TODO"), yet a model may still reach for it. The same watchdog captures any
+# todowrite call on the pinned session, writes the captured items as a prompt.md
+# intake ordering the next session to register them into the stack-tree (inside the
+# current active node), and kills the violating session — the items then run as
+# normal one-task-per-session work instead of diverging state. The kill is skipped
+# while a prompt.md, VIOLATION or TRANSCRIPT already exists (deferred, never overwrite).
+#
+# Session guard: the probe auto-resolves the most recently *updated* session, but a
+# freshly spawned `opencode run` has no DB row yet, so the probe could resolve the
+# previous session. Sessions run strictly sequentially, so each run_session pins its
+# own session by time_created (the row created after this spawn), passes --session-id
+# to the probe, and never acts until its own row exists.
+#
+# Disaster-recovery pipeline: when TRANSCRIPT (the raw overflow export) is present,
+# the runner does NOT hand it to the next session (that is exactly what makes recovery
+# sessions get "compassionate" with the overflowed task and abandon the contract again).
+# Instead it runs an artificial `opencode run` pipeline in three steps before the normal session:
+#   1. summarize  — a session reads the raw transcript and writes a compact summary of every
+#                   task the overflowed session attempted (DR_SUMMARY, default disaster-summary.md);
+#   2. decompose  — a session reads the summary + loop.md and writes a detailed plan breaking
+#                   that work into small per-session tasks (DR_PLAN, default disaster-plan.md);
+#   3. assemble   — the runner joins summary + plan into the processed VIOLATION file, then
+#                   deletes the temporary files and the raw TRANSCRIPT.
+# After the pipeline, the runner calls git-reset-repository: it commits the current state
+# (including the processed VIOLATION), deletes the remote, re-inits the git history and
+# re-pushes as a fresh repository. The next session then does disaster recovery on a small,
+# already-decomposed handoff — forcing proper decomposition in the stack-tree instead of a
+# ~100k transcript.
+#
+# Before each session, a compliance audit runs over every markdown under AUDIT_ROOT
+# (find -L follows symlinks). Any file at or over its line limit triggers a prompt.md
+# ordering the next session to reorganize the stack-tree into a deeper logical structure
+# (push/substack) without losing information, restoring compliance. The prompt is issued
+# at most once per run until the violations clear, so the reorg proceeds as normal
+# sessions instead of an intake loop.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
+PROMPT="${PROMPT:-loop.md}"
+INTAKE="${INTAKE:-prompt.md}"
+BUDGET="${BUDGET:-100000}"
+WATCH_INTERVAL="${WATCH_INTERVAL:-60}"
+VIOLATION="${VIOLATION:-loop-violation.md}"
+TRANSCRIPT="${TRANSCRIPT:-disaster-transcript.md}"
+USAGE_TOOL="${USAGE_TOOL:-scripts/session-context-usage}"
+AUDIT_ROOT="${AUDIT_ROOT:-docs/agent}"
+NODE_LINE_LIMIT="${NODE_LINE_LIMIT:-200}"
+INDEX_LINE_LIMIT="${INDEX_LINE_LIMIT:-150}"
+AUDIT_MARKER="stack-tree-compliance-reorg"
+DR_SUMMARY="${DR_SUMMARY:-disaster-summary.md}"
+DR_PLAN="${DR_PLAN:-disaster-plan.md}"
+
+# Unique per-run id, injected as an inline env marker on every `opencode run` spawn.
+# Only processes carrying LOOP_CONTRACT_RUN_ID=$RUN_ID belong to this loop instance
+# (the marker is inherited by the whole session tree), so Ctrl+C kills precisely this
+# loop's sessions — never unrelated `opencode run` sessions or other loops.
+RUN_ID="$$-$(date +%s%N)-$RANDOM"
+
+if [[ ! -f "$PROMPT" ]]; then
+  echo "error: contract file '$PROMPT' not found in $SCRIPT_DIR" >&2
+  exit 1
+fi
+
+echo "==> Starting infinity loop in $SCRIPT_DIR"
+echo "    Model:  $MODEL"
+echo "    File:   $PROMPT"
+echo "    Budget: $BUDGET tokens (watchdog poll every ${WATCH_INTERVAL}s)"
+echo "    Press Ctrl+C to stop."
+echo
+
+# Global: pid of the current loop session (its process-group leader). The session
+# runs detached in its own session (setsid), so the loop's SIGINT never reaches it;
+# the Ctrl+C trap uses this plus the LOOP_CONTRACT_RUN_ID marker to kill everything
+# this loop spawned.
+CURRENT_PID=""
+
+# Print the pids of every process spawned by this loop instance. Each `opencode run`
+# spawn is prefixed with the inline env marker LOOP_CONTRACT_RUN_ID=$RUN_ID, which is
+# inherited by the whole session tree (setsid, opencode, and the model's own
+# subprocesses). The marker is NOT exported, so the script itself and its own command
+# substitutions never carry it — every matched pid is a session process of this run.
+loop_spawned_pids() {
+  local f
+  for f in $(grep -lF "LOOP_CONTRACT_RUN_ID=$RUN_ID" /proc/[0-9]*/environ 2>/dev/null || true); do
+    f="${f%/environ}"
+    echo "${f##*/}"
+  done
+}
+
+# Kill every process this loop spawned before exiting on Ctrl+C. The opencode session
+# runs in its own session (setsid) and never sees the loop's SIGINT, so a plain
+# trap+exit would leave it running (and consuming budget) until the next watchdog
+# poll. SIGKILL the current session's process group, then every process carrying the
+# run marker (the full session tree, whatever process groups it split into), and any
+# sibling run-loop.sh watchdogs watching the same directory.
+stop_all() {
+  local p pgid self_pgid
+  echo "==> stopping loop — killing this loop's opencode sessions and watchdogs"
+  if [[ -n "${CURRENT_PID:-}" ]]; then
+    kill -KILL -- "-$CURRENT_PID" 2>/dev/null || true
+  fi
+  self_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+  for p in $(loop_spawned_pids); do
+    pgid="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "$pgid" && "$pgid" != "$self_pgid" ]]; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+    kill -KILL "$p" 2>/dev/null || true
+  done
+  # Watchdogs: other run-loop.sh instances watching this same directory only.
+  for p in $(pgrep -f "run-loop\.sh" 2>/dev/null || true); do
+    [[ "$p" == "$$" ]] && continue
+    [[ "$(readlink "/proc/$p/cwd" 2>/dev/null || true)" == "$SCRIPT_DIR" ]] || continue
+    kill -KILL "$p" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+}
+
+# Trap Ctrl+C to stop the whole loop: kill this loop's sessions and watchdogs too.
+trap 'echo -e "\n==> Loop stopped by user."; stop_all; print_token_usage; exit 0' SIGINT SIGTERM
+
+# Run one session in the background with a budget watchdog; kill on overflow.
+# Also watches for harness TODO misuse (loop.md forbids the TODO tool): on capture
+# it writes a prompt.md intake ordering the stack-tree registration and kills the
+# violating session. Returns 1 when the watchdog killed the session, otherwise the
+# opencode exit code.
+run_session() {
+  local pid usage context_used session_id rc todos db_dir db_path start_ts
+
+  # Session guard: pin this session by creation time. The probe resolves the most
+  # recently *updated* session, but a freshly spawned `opencode run` has no row yet,
+  # so it could resolve the previous session. Sessions run sequentially, so the
+  # current session is the row created after this spawn; until it exists the
+  # watchdog never acts (it never touches the previous session).
+  start_ts="$(date +%s%3N)"
+  db_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+  db_path="${OPENCODE_DB:-$db_dir/opencode.db}"
+  [[ "$db_path" == /* ]] || db_path="$db_dir/$db_path"
+
+  LOOP_CONTRACT_RUN_ID="$RUN_ID" setsid opencode run "execute $PROMPT" \
+    --model "$MODEL" \
+    --file "$PROMPT" \
+    --thinking &
+  pid=$!
+  CURRENT_PID="$pid"
+
+  session_id=""
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$WATCH_INTERVAL"
+
+    if [[ -z "$session_id" ]]; then
+      session_id="$(sqlite3 "$db_path" "SELECT id FROM session WHERE directory = '$SCRIPT_DIR' AND time_archived IS NULL AND parent_id IS NULL AND time_created >= $start_ts ORDER BY time_created DESC LIMIT 1;" 2>/dev/null || true)"
+      [[ -n "$session_id" ]] || continue
+    fi
+
+    usage="$( "$USAGE_TOOL" --session-id "$session_id" 2>/dev/null || true )"
+    [[ -n "$usage" ]] || continue
+    context_used="$( printf '%s' "$usage" | jq -r '.context_used // 0' 2>/dev/null || echo 0 )"
+    [[ "${context_used:-0}" =~ ^[0-9]+$ ]] || continue
+    if (( context_used >= BUDGET )) && [[ ! -f "$VIOLATION" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
+      echo "==> BUDGET EXCEEDED (${context_used} tokens) — exporting raw session transcript"
+      opencode export "$session_id" > "$TRANSCRIPT" 2>/dev/null || true
+      echo "==> killing runaway session (pid $pid)"
+      kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 1
+    fi
+
+    # Harness TODO watchdog: while no intake/recovery is already queued, capture any
+    # use of the TODO tool, force the items into the stack-tree via a prompt.md
+    # intake, and kill the diverging session.
+    if [[ ! -f "$INTAKE" ]] && [[ ! -f "$VIOLATION" ]] && [[ ! -f "$TRANSCRIPT" ]]; then
+      todos="$(sqlite3 "$db_path" "SELECT data FROM part WHERE session_id = '$session_id' AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') = 'todowrite' ORDER BY time_created ASC;" 2>/dev/null || true)"
+      if [[ -n "$todos" ]]; then
+        echo "==> HARNESS TODO VIOLATION — model used the TODO tool instead of the stack-tree"
+        write_todo_prompt "$todos"
+        echo "==> killing violating session (pid $pid)"
+        kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+      fi
+    fi
+  done
+
+  rc=0
+  wait "$pid" || rc=$?
+  CURRENT_PID=""
+  return $rc
+}
+
+# Write a prompt.md intake ordering the next session to register the captured
+# harness TODO items into the stack-tree (contract recovery, not a user request).
+# Receives the raw todowrite part JSON lines extracted from the opencode database.
+write_todo_prompt() {
+  local raw="$1"
+  {
+    echo "# Register harness TODO items into the stack-tree (contract violation)"
+    echo
+    echo "The previous session violated the loop.md rule \"Use the contract, not the harness TODO\": it used the opencode TODO tool instead of registering its plan in the stack-tree. The loop runner captured the items below, killed the session, and queued this intake."
+    echo
+    echo "This is a contract-recovery intake, not a user request. Task:"
+    echo "1. Register every item below as a task in the stack-tree, inside the current active node, pushing child substack node(s) per the push/decomposition rules in loop.md as needed — preserving each item's sense and priority."
+    echo "2. Do not execute the work in this session; only internalize the plan into the tree (the items then run as one small task per session)."
+	echo "3. Add a reminder text that it is mandatory to execute only one item per chat session."
+    echo "4. Delete this file (prompt.md) once the tree is updated."
+    echo
+    echo "Captured TODO items:"
+    printf '%s\n' "$raw" | jq -r '.state.input.todos // [] | .[] | "- \(.content)  [status: \(.status // "pending"), priority: \(.priority // "medium")]"' 2>/dev/null || true
+  } > "$INTAKE"
+  echo "==> wrote $INTAKE — next session registers the captured TODO items into the stack-tree"
+}
+
+# Print the current token usage against BUDGET (e.g. 78945/100000) using the probe.
+print_token_usage() {
+  local usage context_used
+  usage="$( "$USAGE_TOOL" 2>/dev/null || true )"
+  context_used="$( printf '%s' "$usage" | jq -r '.context_used // 0' 2>/dev/null || echo 0 )"
+  [[ "$context_used" =~ ^[0-9]+$ ]] || context_used=0
+  echo "==> Token usage: ${context_used}/${BUDGET}"
+}
+
+# Disaster-recovery pipeline. Runs while the raw TRANSCRIPT export exists, before the
+# normal session, to pre-digest the overflowed session's transcript into a small,
+# already-decomposed handoff (the processed VIOLATION). Returns 0 on success, 1 on any
+# step failure (loop aborts so it can be retried with the raw transcript intact).
+run_disaster_recovery_pipeline() {
+  local summary="$DR_SUMMARY" plan="$DR_PLAN"
+
+  echo "==> DISASTER RECOVERY PIPELINE — $TRANSCRIPT found"
+  echo "    Step 1/3: summarizing the overflowed session transcript"
+
+  LOOP_CONTRACT_RUN_ID="$RUN_ID" opencode run \
+    "Read the attached file: the full exported transcript of a previous chat session that exhausted its context budget and was killed because it tried to solve a problem too large for a single session. Do NOT try to solve, continue, or improve anything — analysis and summary only. Identify, explain, and list every task the model attempted during that session: what it set out to do, what it got through, and what was left unfinished. Then overwrite the file '$summary' with a clean, well-structured English markdown document containing that task list and a concise session summary. Do not paste the raw transcript." \
+    --model "$MODEL" \
+    --file "$TRANSCRIPT" \
+    --thinking || return 1
+
+  [[ -s "$summary" ]] || { echo "==> FATAL: pipeline step 1 produced no '$summary'" >&2; return 1; }
+
+  echo "    Step 2/3: decomposing the failed task into per-session steps"
+
+  LOOP_CONTRACT_RUN_ID="$RUN_ID" opencode run \
+    "Read the attached files: '$summary' (summary of a failed chat session) and '$PROMPT' (loop.md, the multi-session work contract). The session summarized in '$summary' violated the loop.md contract: it tried to solve a problem too large for one chat session and exhausted its context budget. Per loop.md, the cure for this failure is decomposition, never compensation. Following the divide-and-conquer rules in loop.md (stack-tree, push/pop, one small task per session), write a detailed decomposition plan: how the work in '$summary' must be broken into small tasks, each suitable for its own chat session, increasing the logical depth of the tree — use as many tasks and levels as needed, depth is absorbed across sessions. For every task give a short title, a one-line description, the session role (orchestrator/loop-explore/loop-worker), and the target artifact. Then overwrite the file '$plan' with that plan as clean, well-structured English markdown. Do not execute any task." \
+    --model "$MODEL" \
+    --file "$summary" \
+    --file "$PROMPT" \
+    --thinking || return 1
+
+  [[ -s "$plan" ]] || { echo "==> FATAL: pipeline step 2 produced no '$plan'" >&2; return 1; }
+
+  echo "    Step 3/3: assembling the processed $VIOLATION"
+
+  {
+    echo "# Disaster recovery — processed session summary and decomposition plan"
+    echo
+    echo "The previous session overflowed the context budget and was killed by the loop runner. This processed file (assembled by the run-loop disaster-recovery pipeline) replaces the raw exported transcript. It holds (1) a summary of every task that failed session attempted and (2) a detailed plan decomposing that work into small per-session tasks. Follow the Disaster recovery procedure in $PROMPT: register the decomposition plan below into the stack-tree as proper nodes/substacks, do NOT try to redo the work inline, then delete this file."
+    echo
+    echo "## 1. Summary of the failed session"
+    echo
+    cat "$summary"
+    echo
+    echo "---"
+    echo
+    echo "## 2. Decomposition plan (small tasks across multiple sessions)"
+    echo
+    cat "$plan"
+  } > "$VIOLATION"
+
+  echo "==> removing temporary pipeline files"
+  rm -f "$summary" "$plan" "$TRANSCRIPT"
+  return 0
+}
+
+# Pre-session compliance audit. Checks every markdown under AUDIT_ROOT (find -L follows
+# symlinks) for the contract's line limits: stack-tree nodes must stay under
+# NODE_LINE_LIMIT lines and index.md under INDEX_LINE_LIMIT lines (see loop.md).
+# On a violation it writes a prompt.md (if none exists) ordering the next session to
+# reorganize the stack-tree so compliance is restored WITHOUT losing information: split
+# oversized nodes into child substack nodes one level deeper, moving overflow tasks down,
+# keeping every task/link/frame. Returns 1 when a violation is present.
+audit_stack_tree() {
+  local file lines limit found=0
+  local -a offenders=()
+
+  [[ -d "$AUDIT_ROOT" ]] || return 0
+
+  while IFS= read -r file; do
+    lines="$(wc -l < "$file" 2>/dev/null || echo 0)"
+    if [[ "$file" == *"/stack-tree/index.md" ]]; then
+      limit="$INDEX_LINE_LIMIT"
+    else
+      limit="$NODE_LINE_LIMIT"
+    fi
+    if (( lines >= limit )); then
+      offenders+=("$file ($lines lines; limit $limit)")
+      found=1
+    fi
+  done < <(find -L "$AUDIT_ROOT" -name '*.md' -type f 2>/dev/null)
+
+  if (( found == 0 )); then
+    return 0
+  fi
+
+  echo "==> STACK-TREE COMPLIANCE VIOLATION — markdown(s) over the line limit:"
+  printf '    %s\n' "${offenders[@]}"
+
+  if [[ -f "$INTAKE" ]]; then
+    echo "==> $INTAKE already exists — keeping it; compliance prompt will wait."
+    return 1
+  fi
+
+  {
+    echo "# Stack-tree compliance: markdown line-limit exceeded"
+    echo
+    echo "The loop runner's pre-session audit found stack-tree markdowns at/over the contract's line limits (nodes < $NODE_LINE_LIMIT lines; index.md < $INDEX_LINE_LIMIT lines)."
+    echo
+    echo "Offenders:"
+    printf -- '- %s\n' "${offenders[@]}"
+    echo
+    echo "Task: reorganize the stack-tree so every markdown complies, WITHOUT losing any information, by increasing the tree's logical depth. For each oversized node, split its stack into one or more child substack nodes (push; depth+1), link them from the parent node, and move the overflowing tasks into the children. Preserve every task, every link, and the session frame. Keep index.md under $INDEX_LINE_LIMIT lines. Verify at the end with:"
+    echo "  find -L docs/agent/stack-tree -name '*.md' -exec wc -l {} +"
+  } > "$INTAKE"
+  echo "==> wrote $INTAKE — next session will reorganize the stack-tree for compliance."
+  return 1
+}
+
+ITERATION=1
+while true; do
+  echo "--------------------------------------------------------------------------------"
+  echo "==> Session Loop Iteration #$ITERATION [$(date '+%Y-%m-%d %H:%M:%S')]"
+  echo "--------------------------------------------------------------------------------"
+
+  audit_stack_tree || true
+
+  if [[ -f "$INTAKE" ]]; then
+    echo "==> $INTAKE found — translating to en-us before intake"
+    if ! LOOP_CONTRACT_RUN_ID="$RUN_ID" opencode run "translate $INTAKE fully to en-us, rewriting the file in place" \
+      --model "$MODEL" \
+      --file "$INTAKE" \
+      --thinking; then
+      echo "==> FATAL: translation session failed — aborting loop to avoid pt-br intake" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ -f "$TRANSCRIPT" ]]; then
+    echo "==> $TRANSCRIPT found — running the disaster-recovery pipeline before the next session"
+    if ! run_disaster_recovery_pipeline; then
+      echo "==> FATAL: disaster-recovery pipeline failed — aborting loop (raw transcript kept for retry)" >&2
+      exit 1
+    fi
+    echo "==> running git-reset-repository (commits current state, resets history, re-pushes)"
+    if ! git-reset-repository; then
+      echo "==> FATAL: git-reset-repository failed — aborting loop" >&2
+      exit 1
+    fi
+    echo "==> pipeline done — next session enters disaster recovery with the processed handoff"
+  fi
+
+  run_session || {
+    echo "==> session ended abnormally — pausing 2s before restart..."
+  }
+
+  git-sloopy-upload
+
+  print_token_usage
+
+  ITERATION=$((ITERATION + 1))
+  sleep 1
+done
+
