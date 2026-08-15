@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 
-MODEL="${1:-${MODEL:-google/gemini-flash-lite-latest}}"
+MODEL="${1:-${MODEL:-deepseek/deepseek-v4-flash}}"
 
 # run-loop — generic runner script to execute the multi-session infinity loop.
 # Usage: ./run-loop [model]
